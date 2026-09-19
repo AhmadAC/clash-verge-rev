@@ -81,6 +81,26 @@ jobs:
       - name: Download Sidecars & Mihomo Cores
         run: pnpm run prebuild ${{ matrix.target }}
 
+      # Disables upstream updater signing requirement so the build finishes with exit code 0
+      - name: Disable Updater Signing Key Check for Fork Builds
+        shell: bash
+        run: |
+          node -e '
+            const fs = require("fs");
+            const file = "src-tauri/tauri.conf.json";
+            if (fs.existsSync(file)) {
+              const config = JSON.parse(fs.readFileSync(file, "utf8"));
+              if (config.plugins && config.plugins.updater && config.plugins.updater.pubkey) {
+                delete config.plugins.updater.pubkey;
+              }
+              if (config.bundle && config.bundle.createUpdaterArtifacts) {
+                delete config.bundle.createUpdaterArtifacts;
+              }
+              fs.writeFileSync(file, JSON.stringify(config, null, 2));
+              console.log("[+] Disabled updater signature check for fork build.");
+            }
+          '
+
       - name: Build Tauri Application
         run: pnpm tauri build --target ${{ matrix.target }}
 
@@ -93,11 +113,12 @@ jobs:
             **/bundle/nsis/*.exe
             **/bundle/msi/*.msi
 
-      - name: Upload Linux Packages (.deb and .AppImage)
+      - name: Upload Linux Packages (.deb, .rpm, .AppImage)
         if: matrix.platform == 'linux'
         uses: actions/upload-artifact@v4
         with:
           name: Clash-Verge-Rev-Linux-x64
           path: |
             **/bundle/deb/*.deb
+            **/bundle/rpm/*.rpm
             **/bundle/appimage/*.AppImage
