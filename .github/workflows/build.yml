@@ -81,28 +81,32 @@ jobs:
       - name: Download Sidecars & Mihomo Cores
         run: pnpm run prebuild ${{ matrix.target }}
 
-      # Generate valid signing keypair so both Tauri compiler and runtime updater plugin are satisfied
+      # Generates a valid signing keypair and safely writes to GITHUB_ENV without Windows CRLF conflicts
       - name: Setup Valid Updater Keys for Fork
         shell: bash
         run: |
           pnpm tauri signer generate --ci -w ./ci_key
           node -e '
             const fs = require("fs");
-            const file = "src-tauri/tauri.conf.json";
-            if (fs.existsSync(file)) {
-              const config = JSON.parse(fs.readFileSync(file, "utf8"));
+
+            // 1. Inject valid public key into tauri.conf.json for runtime
+            const confFile = "src-tauri/tauri.conf.json";
+            if (fs.existsSync(confFile)) {
+              const config = JSON.parse(fs.readFileSync(confFile, "utf8"));
               if (!config.plugins) config.plugins = {};
               if (!config.plugins.updater) config.plugins.updater = {};
               config.plugins.updater.pubkey = fs.readFileSync("./ci_key.pub", "utf8").trim();
-              fs.writeFileSync(file, JSON.stringify(config, null, 2));
+              fs.writeFileSync(confFile, JSON.stringify(config, null, 2));
               console.log("[+] Injected valid updater pubkey into tauri.conf.json");
             }
+
+            // 2. Strip Windows carriage returns (\r) so GitHub Actions matches EOF delimiter cleanly
+            const key = fs.readFileSync("./ci_key", "utf8").replace(/\r/g, "").trim();
+            if (process.env.GITHUB_ENV) {
+              fs.appendFileSync(process.env.GITHUB_ENV, `TAURI_SIGNING_PRIVATE_KEY<<EOF\n${key}\nEOF\n`);
+              console.log("[+] Successfully set TAURI_SIGNING_PRIVATE_KEY in GITHUB_ENV");
+            }
           '
-          {
-            echo "TAURI_SIGNING_PRIVATE_KEY<<EOF"
-            cat ./ci_key
-            echo "EOF"
-          } >> "$GITHUB_ENV"
 
       - name: Build Tauri Application
         run: pnpm tauri build --target ${{ matrix.target }}
