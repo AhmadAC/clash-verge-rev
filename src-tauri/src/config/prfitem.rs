@@ -13,10 +13,40 @@ use serde::{Deserialize, Serialize};
 use serde_yaml_ng::Mapping;
 use smartstring::alias::String;
 use std::collections::HashMap;
+use std::io::Write as _;
 use std::string::String as StdString;
 use std::time::Duration;
 use tauri::Url;
 use tokio::fs;
+
+fn write_debug_log(entry: &str) {
+    let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    let formatted = format!("[{timestamp}] {entry}\n");
+
+    // 1. Try writing next to clash-verge.exe (works if portable or run as Admin)
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            let log_file = exe_dir.join("sub_converter_debug.log");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)
+                .and_then(|mut f| f.write_all(formatted.as_bytes()));
+        }
+    }
+
+    // 2. Always write to AppData folder (guaranteed to succeed without UAC permission blocks)
+    if let Ok(profiles_dir) = dirs::app_profiles_dir() {
+        if let Some(app_home) = profiles_dir.parent() {
+            let log_file = app_home.join("sub_converter_debug.log");
+            let _ = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(log_file)
+                .and_then(|mut f| f.write_all(formatted.as_bytes()));
+        }
+    }
+}
 
 pub(super) fn normalize_profile_home_url(raw: &str) -> Option<String> {
     let url = Url::parse(raw.trim()).ok()?;
@@ -144,7 +174,6 @@ impl PrfOption {
 }
 
 impl PrfItem {
-    /// Builds an item from a partial value that must include `itype`.
     pub(super) async fn from(item: &Self, file_data: Option<String>) -> Result<Self> {
         let itype = item
             .itype
@@ -246,7 +275,13 @@ impl PrfItem {
         let self_proxy = option.is_some_and(|o| o.self_proxy.unwrap_or(false));
         let accept_invalid_certs = option.is_some_and(|o| o.danger_accept_invalid_certs.unwrap_or(false));
         let allow_auto_update = Some(allow_auto_update_enabled(option));
-        let user_agent = option.and_then(|o| o.user_agent.clone());
+
+        // Auto fallback to shadowsocks-android User-Agent for shadowsocks panels
+        let user_agent = option
+            .and_then(|o| o.user_agent.clone())
+            .filter(|u| !u.trim().is_empty())
+            .or_else(|| Some("shadowsocks-android/5.3.5".into()));
+
         let update_interval = option.and_then(|o| o.update_interval);
         let timeout = option.and_then(|o| o.timeout_seconds).unwrap_or(20);
         let mut merge = option.and_then(|o| o.merge.clone());
@@ -263,6 +298,11 @@ impl PrfItem {
             ProxyType::None
         };
 
+        write_debug_log(&format!(
+            "Attempting to fetch URL: {url} | User-Agent: {:?} | ProxyType: {:?}",
+            user_agent, proxy_type
+        ));
+
         let url = fix_dirty_url(url)?;
 
         let resp = match NetworkManager::new()
@@ -277,13 +317,16 @@ impl PrfItem {
         {
             Ok(r) => r,
             Err(e) => {
+                write_debug_log(&format!("Network request failed: {e}"));
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 return Err(e).context("failed to fetch remote profile");
             }
         };
 
         let status_code = resp.status();
+        write_debug_log(&format!("Response status code: {status_code}"));
         if !status_code.is_success() {
+            write_debug_log(&format!("Fetch aborted due to non-success status: {status_code}"));
             bail!("failed to fetch remote profile with status {status_code}")
         }
 
@@ -354,8 +397,16 @@ impl PrfItem {
         let name = name
             .map(|s| s.to_owned())
             .unwrap_or_else(|| filename.map(|s| s.into()).unwrap_or_else(|| "Remote File".into()));
+
         let data = resp.text();
         let data = data.trim_start_matches('\u{feff}');
+
+        let preview_len = data.len().min(300);
+        write_debug_log(&format!(
+            "Raw response length: {} bytes | Preview: {}",
+            data.len(),
+            &data[..preview_len]
+        ));
 
         let converted_yaml = convert_sub_content_to_clash_yaml(data);
         let data = converted_yaml.as_str();
@@ -363,8 +414,11 @@ impl PrfItem {
         let yaml = serde_yaml_ng::from_str::<Mapping>(data).context("the remote profile data is invalid yaml")?;
 
         if !yaml.contains_key("proxies") && !yaml.contains_key("proxy-providers") {
+            write_debug_log("YAML does not contain proxies or proxy-providers keys.");
             bail!("profile does not contain `proxies` or `proxy-providers`");
         }
+
+        write_debug_log(&format!("Successfully converted and validated profile for UID: {uid}"));
 
         if merge.is_none() {
             let merge_item = &mut Self::from_merge(None);
@@ -402,6 +456,7 @@ impl PrfItem {
             selected: None,
             extra,
             option: Some(PrfOption {
+                user_agent,
                 update_interval,
                 merge,
                 script,
@@ -572,6 +627,15 @@ fn safe_base64_decode(input: &str) -> Option<StdString> {
         }
     }
     None
+}
+
+fn val_to_str(v: &serde_json::Value) -> Option<StdString> {
+    match v {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Number(n) => Some(n.to_string()),
+        serde_json::Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
 }
 
 fn parse_ss_uri(uri: &str) -> Option<serde_json::Value> {
@@ -958,8 +1022,8 @@ fn parse_json_node_array(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> 
             Some(o) => o,
             None => continue,
         };
-        let server = match obj.get("server").and_then(|v| v.as_str()) {
-            Some(s) if s != "8.8.8.8" => s,
+        let server = match obj.get("server").and_then(val_to_str) {
+            Some(s) if s != "8.8.8.8" && !s.trim().is_empty() => s,
             _ => continue,
         };
         let port: u16 = match obj.get("server_port").or_else(|| obj.get("port")) {
@@ -973,16 +1037,17 @@ fn parse_json_node_array(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> 
             },
             _ => continue,
         };
-        let password = match obj.get("password").and_then(|v| v.as_str()) {
-            Some(p) => p,
-            None => continue,
+        let password = match obj.get("password").and_then(val_to_str) {
+            Some(p) if !p.trim().is_empty() => p,
+            _ => continue,
         };
-        let cipher = match obj.get("method").or_else(|| obj.get("cipher")).and_then(|v| v.as_str()) {
-            Some(c) => c,
-            None => continue,
+        let cipher = match obj.get("method").or_else(|| obj.get("cipher")).and_then(val_to_str) {
+            Some(c) if !c.trim().is_empty() => c,
+            _ => continue,
         };
 
-        let remarks = obj.get("remarks").and_then(|v| v.as_str()).unwrap_or("").trim();
+        let remarks = obj.get("remarks").and_then(val_to_str).unwrap_or_default();
+        let remarks = remarks.trim();
         if remarks == "Surinameas" {
             continue;
         }
@@ -996,10 +1061,10 @@ fn parse_json_node_array(nodes: &[serde_json::Value]) -> Vec<serde_json::Value> 
         let mut proxy = serde_json::Map::new();
         proxy.insert("name".into(), serde_json::Value::String(name));
         proxy.insert("type".into(), serde_json::Value::String("ss".into()));
-        proxy.insert("server".into(), serde_json::Value::String(server.to_string()));
+        proxy.insert("server".into(), serde_json::Value::String(server));
         proxy.insert("port".into(), serde_json::Value::Number(port.into()));
-        proxy.insert("cipher".into(), serde_json::Value::String(cipher.to_string()));
-        proxy.insert("password".into(), serde_json::Value::String(password.to_string()));
+        proxy.insert("cipher".into(), serde_json::Value::String(cipher));
+        proxy.insert("password".into(), serde_json::Value::String(password));
         proxy.insert("udp".into(), serde_json::Value::Bool(true));
 
         proxies.push(serde_json::Value::Object(proxy));
@@ -1018,16 +1083,21 @@ fn convert_sub_content_to_clash_yaml(raw_data: &str) -> StdString {
 
     let mut proxies: Vec<serde_json::Value> = Vec::new();
 
+    // 1. Try parsing JSON (supports top-level list, or wrapped in servers/proxies/data/list/nodes)
     if let Ok(val) = serde_json::from_str::<serde_json::Value>(trimmed) {
         if let Some(arr) = val.as_array() {
             proxies.extend(parse_json_node_array(arr));
         } else if let Some(obj) = val.as_object() {
-            if let Some(arr) = obj.get("servers").or_else(|| obj.get("proxies")).and_then(|v| v.as_array()) {
-                proxies.extend(parse_json_node_array(arr));
+            for key in ["servers", "proxies", "data", "list", "nodes"] {
+                if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+                    proxies.extend(parse_json_node_array(arr));
+                    break;
+                }
             }
         }
     }
 
+    // 2. Try decoding base64 if no nodes parsed yet
     let mut candidate_str = trimmed.to_string();
     if proxies.is_empty() {
         if let Some(decoded) = safe_base64_decode(trimmed) {
@@ -1035,6 +1105,13 @@ fn convert_sub_content_to_clash_yaml(raw_data: &str) -> StdString {
                 if let Ok(val) = serde_json::from_str::<serde_json::Value>(&decoded) {
                     if let Some(arr) = val.as_array() {
                         proxies.extend(parse_json_node_array(arr));
+                    } else if let Some(obj) = val.as_object() {
+                        for key in ["servers", "proxies", "data", "list", "nodes"] {
+                            if let Some(arr) = obj.get(key).and_then(|v| v.as_array()) {
+                                proxies.extend(parse_json_node_array(arr));
+                                break;
+                            }
+                        }
                     }
                 }
                 candidate_str = decoded;
@@ -1042,6 +1119,7 @@ fn convert_sub_content_to_clash_yaml(raw_data: &str) -> StdString {
         }
     }
 
+    // 3. Line by line parsing for URIs
     if proxies.is_empty() {
         for line in candidate_str.lines() {
             let line = line.trim();
@@ -1073,9 +1151,16 @@ fn convert_sub_content_to_clash_yaml(raw_data: &str) -> StdString {
     }
 
     if proxies.is_empty() {
+        write_debug_log("Conversion: No proxies could be extracted from response content.");
         return trimmed.to_string();
     }
 
+    write_debug_log(&format!(
+        "Conversion: Successfully parsed {} proxies! Generating Clash config...",
+        proxies.len()
+    ));
+
+    // Deduplicate proxy names
     let mut used_names = HashMap::new();
     let mut proxy_names = Vec::new();
 
