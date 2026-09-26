@@ -11,10 +11,26 @@ use crate::{
 use anyhow::{Context as _, Result};
 use clash_verge_logging::Type;
 use log::Level;
-use scopeguard::defer;
 use std::path::Path;
 use tauri_plugin_mihomo::MihomoExt as _;
 use tauri_plugin_shell::ShellExt as _;
+
+#[cfg(target_os = "windows")]
+fn sidecar_config_without_tun(yaml: &str) -> Result<std::string::String> {
+    use serde_yaml_ng::{Mapping, Value};
+
+    let mut config: Mapping = serde_yaml_ng::from_str(yaml)?;
+    let tun = config
+        .entry(Value::from("tun"))
+        .or_insert_with(|| Value::Mapping(Mapping::new()));
+    if !tun.is_mapping() {
+        *tun = Value::Mapping(Mapping::new());
+    }
+    tun.as_mapping_mut()
+        .context("invalid Sidecar TUN configuration")?
+        .insert(Value::from("enable"), Value::Bool(false));
+    Ok(serde_yaml_ng::to_string(&config)?)
+}
 
 const SIDECAR_READINESS_ATTEMPTS: usize = 30;
 
@@ -136,12 +152,25 @@ impl CoreManager {
 
     #[tracing::instrument(skip_all, level = "info", fields(pid = tracing::field::Empty))]
     pub(super) async fn start_core_by_sidecar(&self) -> Result<()> {
+        self.wait_for_sidecar_exit().await?;
+        let execution = clash_verge_service_ipc::execution::reserve_sidecar()
+            .await
+            .inspect_err(service::record_residual_service)?;
         self.core_stopped();
 
         let sidecar_ipc = dirs::sidecar_ipc_path()?;
         handle::Handle::app_handle()
             .mihomo()
             .update_socket_path(dirs::path_to_str(&sidecar_ipc)?.to_owned())?;
+        #[cfg(target_os = "windows")]
+        let config_file = if crate::core::runstate::RUN_STATE.state().is_admin {
+            Config::generate_file().await?
+        } else {
+            // Reconciliation persists the preference later; the first spawn must already have TUN off.
+            let yaml = sidecar_config_without_tun(&Config::runtime_config_yaml().await?)?;
+            Config::write_runtime_file(&yaml).await?
+        };
+        #[cfg(not(target_os = "windows"))]
         let config_file = Config::generate_file().await?;
         let app_handle = handle::Handle::app_handle();
         let clash_core = Config::verge().await.latest_arc().get_valid_clash_core();
@@ -179,6 +208,8 @@ impl CoreManager {
                 config_dir.display()
             )
         })?;
+        let (terminated, termination) = tokio::sync::oneshot::channel();
+        *self.sidecar_exit.lock().await = Some(execution.release_after_exit(child.pid(), termination));
         #[cfg(target_os = "windows")]
         let job = {
             match create_and_assign_sidecar_job(child.pid()) {
@@ -208,6 +239,40 @@ impl CoreManager {
         let pid = child.pid();
         tracing::Span::current().record("pid", pid);
 
+        // The sidecar has to be drained from the moment it starts. tauri-plugin-shell buffers a
+        // single event, so an unread channel stalls its reader threads and the core blocks on a
+        // full stdout pipe before it ever creates the API socket.
+        let core_readiness_generation = self.mark_core_ready();
+        AsyncHandler::spawn(move || async move {
+            while let Some(event) = rx.recv().await {
+                match event {
+                    tauri_plugin_shell::process::CommandEvent::Stdout(line)
+                    | tauri_plugin_shell::process::CommandEvent::Stderr(line) => {
+                        let message = String::from_utf8_lossy(&line).into_owned();
+                        Logger::global().writer_sidecar_log(Level::Error, &message);
+                        CLASH_LOGGER.append_log(message);
+                    }
+                    tauri_plugin_shell::process::CommandEvent::Terminated(term) => {
+                        let _ = terminated.send(());
+                        let manager = Self::global();
+                        let _ = manager.invalidate_core_readiness_if(core_readiness_generation);
+                        let message = if let Some(code) = term.code {
+                            format!("Process terminated with code: {}", code)
+                        } else if let Some(signal) = term.signal {
+                            format!("Process terminated by signal: {}", signal)
+                        } else {
+                            String::from("Process terminated")
+                        };
+                        Logger::global().writer_sidecar_log(Level::Info, &message);
+                        CLASH_LOGGER.clear_logs();
+                        manager.clear_terminated_sidecar(pid).await;
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        });
+
         let readiness = poll_sidecar_readiness(SIDECAR_READINESS_ATTEMPTS, SIDECAR_READINESS_INTERVAL, || async {
             tokio::time::timeout(SIDECAR_READINESS_PROBE_TIMEOUT, async {
                 handle::Handle::mihomo().get_version().await
@@ -231,48 +296,15 @@ impl CoreManager {
         #[cfg(target_os = "windows")]
         self.set_job_handle(Some(job));
         self.set_running_child_sidecar(child);
-        let core_readiness_generation = self.mark_core_ready();
         self.core_started(RunningMode::Sidecar);
         self.restore_selected_nodes().await;
-
-        AsyncHandler::spawn(move || async move {
-            while let Some(event) = rx.recv().await {
-                match event {
-                    tauri_plugin_shell::process::CommandEvent::Stdout(line)
-                    | tauri_plugin_shell::process::CommandEvent::Stderr(line) => {
-                        let message = String::from_utf8_lossy(&line).into_owned();
-                        Logger::global().writer_sidecar_log(Level::Error, &message);
-                        CLASH_LOGGER.append_log(message);
-                    }
-                    tauri_plugin_shell::process::CommandEvent::Terminated(term) => {
-                        let manager = Self::global();
-                        let _ = manager.invalidate_core_readiness_if(core_readiness_generation);
-                        let message = if let Some(code) = term.code {
-                            format!("Process terminated with code: {}", code)
-                        } else if let Some(signal) = term.signal {
-                            format!("Process terminated by signal: {}", signal)
-                        } else {
-                            String::from("Process terminated")
-                        };
-                        Logger::global().writer_sidecar_log(Level::Info, &message);
-                        CLASH_LOGGER.clear_logs();
-                        manager.clear_terminated_sidecar(pid).await;
-                        break;
-                    }
-                    _ => {}
-                }
-            }
-        });
 
         Ok(())
     }
 
     /// Terminates the sidecar after its caller has successfully cleared the
     /// system proxy.
-    pub(super) fn stop_core_by_sidecar_unprepared(&self) {
-        defer! {
-            self.core_stopped();
-        }
+    pub(super) async fn stop_core_by_sidecar_unprepared(&self) -> Result<()> {
         if let Some(child) = self.take_child_sidecar() {
             let pid = child.pid();
 
@@ -288,6 +320,22 @@ impl CoreManager {
                 logging!(warn, Type::Core, "failed to terminate sidecar PID {pid}: {error:#}");
             }
         }
+        let result = self.wait_for_sidecar_exit().await;
+        self.core_stopped();
+        result
+    }
+
+    async fn wait_for_sidecar_exit(&self) -> Result<()> {
+        let mut exit = self.sidecar_exit.lock().await;
+        if let Some(task) = exit.as_mut() {
+            tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                .await
+                .context("Sidecar has not exited; core handoff is blocked")?
+                .context("Sidecar exit monitoring failed")?;
+            exit.take();
+        }
+        drop(exit);
+        Ok(())
     }
 
     pub(super) async fn start_core_by_service(&self) -> Result<()> {

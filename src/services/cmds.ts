@@ -172,10 +172,14 @@ export async function patchVergeConfig(payload: IVergeConfig) {
   return invoke<void>('patch_verge_config', { payload })
 }
 
-export async function setDnsOverride(enabled: boolean, confirmation?: string) {
+export async function setDnsOverride(
+  profileUid: string,
+  enabled: boolean,
+  confirmation?: string,
+) {
   return invoke<
     { status: 'applied' } | { status: 'confirmation_required'; source: string }
-  >('set_dns_override', { enabled, confirmation })
+  >('set_dns_override', { profileUid, enabled, confirmation })
 }
 
 export async function takeDnsOverrideNotice() {
@@ -184,6 +188,27 @@ export async function takeDnsOverrideNotice() {
 
 export async function takeServiceFallbackNotice() {
   return invoke<boolean>('take_service_fallback_notice')
+}
+
+export interface CoreFailure {
+  kind: 'startFailed' | 'serviceCoreStopped'
+  detail: string
+}
+
+export async function getCoreStartupError() {
+  return invoke<CoreFailure | null>('get_core_startup_error')
+}
+
+export async function takeServiceRepairNotice() {
+  return invoke<boolean>('take_service_repair_notice')
+}
+
+export async function takeServiceOwnerNotice() {
+  return invoke<string | null>('take_service_owner_notice')
+}
+
+export async function takeDiscardedKeysNotice() {
+  return invoke<string | null>('take_discarded_keys_notice')
 }
 
 export async function getSystemProxy() {
@@ -442,8 +467,12 @@ export const getAppUptime = async () => {
   return invoke<number>('get_app_uptime')
 }
 
+export type ServiceInstallOutcome =
+  | { status: 'installed' }
+  | { status: 'sidecar'; reason: string }
+
 export const installService = async () => {
-  return invoke<void>('install_service')
+  return invoke<ServiceInstallOutcome>('install_service')
 }
 
 export const uninstallService = async () => {
@@ -451,11 +480,11 @@ export const uninstallService = async () => {
 }
 
 export const reinstallService = async () => {
-  return invoke<void>('reinstall_service')
+  return invoke<ServiceInstallOutcome>('reinstall_service')
 }
 
 export const repairService = async () => {
-  return invoke<void>('repair_service')
+  return invoke<ServiceInstallOutcome>('repair_service')
 }
 
 export const continueWithSidecar = async () => {
