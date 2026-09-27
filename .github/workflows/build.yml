@@ -1,4 +1,4 @@
-name: Build Windows 11 & Linux Installers
+name: Build Windows 11 & Fedora RPM Installers
 
 on:
   workflow_dispatch:
@@ -18,10 +18,12 @@ jobs:
           - os: windows-latest
             platform: windows
             target: x86_64-pc-windows-msvc
+            bundle_args: ""
 
           - os: ubuntu-22.04
             platform: linux
             target: x86_64-unknown-linux-gnu
+            bundle_args: "--bundles rpm"
 
     runs-on: ${{ matrix.os }}
 
@@ -72,7 +74,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev \
             patchelf \
-            squashfs-tools \
+            rpm \
             libxslt1.1
 
       - name: Install Node Modules
@@ -109,7 +111,7 @@ jobs:
           '
 
       - name: Build Tauri Application
-        run: pnpm tauri build --target ${{ matrix.target }}
+        run: pnpm tauri build --target ${{ matrix.target }} ${{ matrix.bundle_args }}
 
       - name: Upload Windows 11 Installer
         if: matrix.platform == 'windows'
@@ -120,12 +122,10 @@ jobs:
             **/bundle/nsis/*.exe
             **/bundle/msi/*.msi
 
-      - name: Upload Linux Packages (.deb, .rpm, .AppImage)
+      - name: Upload Fedora RPM Installer
         if: matrix.platform == 'linux'
         uses: actions/upload-artifact@v4
         with:
-          name: Clash-Verge-Rev-Linux-x64
+          name: Clash-Verge-Rev-Fedora-RPM-x64
           path: |
-            **/bundle/deb/*.deb
             **/bundle/rpm/*.rpm
-            **/bundle/appimage/*.AppImage
