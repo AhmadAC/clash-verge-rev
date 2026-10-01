@@ -138,8 +138,11 @@ export const AppDataProvider = ({
   // ---------------- Auto Recovery Logic ----------------
   useEffect(() => {
     const handleDeadNodesRecovery = async () => {
-      // Only proceed if TUN mode is enabled and we are not already recovering
-      if (!verge?.enable_tun_mode || isRecoveringRef.current || !proxyView?.proxies) {
+      const rawView = proxyView as any
+      const rawProxies = rawView?.proxies || rawView?.records || rawView?.items || rawView?.nodes
+
+      // Only proceed if TUN mode is enabled, not currently recovering, and proxies exist
+      if (!verge?.enable_tun_mode || isRecoveringRef.current || !rawProxies) {
         return
       }
 
@@ -148,9 +151,10 @@ export const AppDataProvider = ({
         return
       }
 
-      // Filter for actual proxy server nodes (ignore selectors, global, direct, reject)
-      const proxyNodes = Object.values(proxyView.proxies).filter((node: any) =>
-        PROXY_SERVER_TYPES.has(node.type)
+      // Filter for actual proxy server nodes (ignore selectors, groups, direct, reject)
+      const proxyList = Array.isArray(rawProxies) ? rawProxies : Object.values(rawProxies)
+      const proxyNodes = proxyList.filter((node: any) =>
+        node?.type && PROXY_SERVER_TYPES.has(node.type)
       )
 
       if (proxyNodes.length === 0) return
@@ -173,9 +177,10 @@ export const AppDataProvider = ({
           await new Promise((resolve) => setTimeout(resolve, 2000))
 
           // 2. Refresh active subscription profile
-          if (currentProfile) {
-            console.log(`[Auto-Recovery] Updating subscription: ${currentProfile}`)
-            await updateProfile(currentProfile)
+          const targetUid = typeof currentProfile === 'string' ? currentProfile : currentProfile?.uid
+          if (targetUid) {
+            console.log(`[Auto-Recovery] Updating subscription: ${targetUid}`)
+            await updateProfile(targetUid)
             await new Promise((resolve) => setTimeout(resolve, 3000))
           }
 
