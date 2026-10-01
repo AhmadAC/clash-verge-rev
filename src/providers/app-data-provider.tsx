@@ -6,9 +6,16 @@ import {
 } from 'tauri-plugin-mihomo-api'
 
 import { useClashInfo, useRuntimeConfig } from '@/hooks/use-clash'
+import { useProfiles } from '@/hooks/use-profiles'
 import { runStateQueryKey } from '@/hooks/use-system-state'
 import { useVerge } from '@/hooks/use-verge'
-import { getProxyView, getRuntimeState, getSystemProxy } from '@/services/cmds'
+import {
+  getProxyView,
+  getRuntimeState,
+  getSystemProxy,
+  patchVergeConfig,
+  updateProfile,
+} from '@/services/cmds'
 import { subscribeVergeEvents } from '@/services/events'
 import { useQuery } from '@/services/query-client'
 import { resolveDisplayedMixedPort } from '@/utils/mixed-port'
@@ -37,6 +44,21 @@ const TQ_DEFAULTS = {
   retry: 2,
 } as const
 
+const PROXY_SERVER_TYPES = new Set([
+  'Shadowsocks',
+  'ShadowsocksR',
+  'Vmess',
+  'Vless',
+  'Trojan',
+  'Hysteria',
+  'Hysteria2',
+  'WireGuard',
+  'Tuic',
+  'Ssh',
+  'Http',
+  'Socks5',
+])
+
 function useStableFn<T extends (...args: any[]) => any>(fn: T): T {
   const ref = useRef(fn)
   ref.current = fn
@@ -50,8 +72,12 @@ export const AppDataProvider = ({
   children: React.ReactNode
 }) => {
   const { verge } = useVerge()
+  const { current: currentProfile } = useProfiles()
   const { data: runtimeConfig } = useRuntimeConfig()
   const { clashInfo } = useClashInfo()
+
+  const isRecoveringRef = useRef(false)
+  const lastRecoveryTimeRef = useRef(0)
 
   const {
     data: proxyView,
@@ -108,6 +134,68 @@ export const AppDataProvider = ({
   const refreshRules = useStableFn(_refetchRules)
   const refreshSysproxy = useStableFn(_refetchSysproxy)
   const refreshRuleProviders = useStableFn(_refetchRuleProviders)
+
+  // ---------------- Auto Recovery Logic ----------------
+  useEffect(() => {
+    const handleDeadNodesRecovery = async () => {
+      // Only proceed if TUN mode is enabled and we are not already recovering
+      if (!verge?.enable_tun_mode || isRecoveringRef.current || !proxyView?.proxies) {
+        return
+      }
+
+      // Enforce a minimum 60-second cooldown between auto-recovery attempts
+      if (Date.now() - lastRecoveryTimeRef.current < 60000) {
+        return
+      }
+
+      // Filter for actual proxy server nodes (ignore selectors, global, direct, reject)
+      const proxyNodes = Object.values(proxyView.proxies).filter((node: any) =>
+        PROXY_SERVER_TYPES.has(node.type)
+      )
+
+      if (proxyNodes.length === 0) return
+
+      // Check if all proxy nodes have failed / timed out (delay === 0 or undefined)
+      const allDead = proxyNodes.every((node: any) => {
+        const lastDelay = node.history?.[node.history.length - 1]?.delay
+        return !lastDelay || lastDelay === 0
+      })
+
+      if (allDead) {
+        console.warn(
+          '[Auto-Recovery] All proxy nodes are dead. Temporarily disabling TUN mode to refresh subscription...'
+        )
+        isRecoveringRef.current = true
+
+        try {
+          // 1. Temporarily disable TUN mode
+          await patchVergeConfig({ enable_tun_mode: false })
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+
+          // 2. Refresh active subscription profile
+          if (currentProfile) {
+            console.log(`[Auto-Recovery] Updating subscription: ${currentProfile}`)
+            await updateProfile(currentProfile)
+            await new Promise((resolve) => setTimeout(resolve, 3000))
+          }
+
+          // 3. Re-enable TUN mode
+          await patchVergeConfig({ enable_tun_mode: true })
+          console.log('[Auto-Recovery] Subscription updated. TUN mode re-enabled.')
+        } catch (error) {
+          console.error('[Auto-Recovery Error]', error)
+        } finally {
+          lastRecoveryTimeRef.current = Date.now()
+          setTimeout(() => {
+            isRecoveringRef.current = false
+          }, 15000)
+        }
+      }
+    }
+
+    handleDeadNodesRecovery()
+  }, [proxyView, verge?.enable_tun_mode, currentProfile])
+  // -----------------------------------------------------
 
   useEffect(() => {
     let lastProxyUpdateTime = 0
