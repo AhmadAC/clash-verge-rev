@@ -1,0 +1,131 @@
+name: Build Windows 11 & Fedora RPM Installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-app:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: windows
+            target: x86_64-pc-windows-msvc
+            bundle_args: ""
+
+          - os: ubuntu-22.04
+            platform: linux
+            target: x86_64-unknown-linux-gnu
+            bundle_args: "--bundles rpm"
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          run_install: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install Linux Build Dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libssl-dev \
+            libgtk-3-dev \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            patchelf \
+            rpm \
+            libxslt1.1
+
+      - name: Install Node Modules
+        run: pnpm install
+
+      - name: Download Sidecars & Mihomo Cores
+        run: pnpm run prebuild ${{ matrix.target }}
+
+      # Generates a valid signing keypair and safely writes to GITHUB_ENV without Windows CRLF conflicts
+      - name: Setup Valid Updater Keys for Fork
+        shell: bash
+        run: |
+          pnpm tauri signer generate --ci -w ./ci_key
+          node -e '
+            const fs = require("fs");
+
+            // 1. Inject valid public key into tauri.conf.json for runtime
+            const confFile = "src-tauri/tauri.conf.json";
+            if (fs.existsSync(confFile)) {
+              const config = JSON.parse(fs.readFileSync(confFile, "utf8"));
+              if (!config.plugins) config.plugins = {};
+              if (!config.plugins.updater) config.plugins.updater = {};
+              config.plugins.updater.pubkey = fs.readFileSync("./ci_key.pub", "utf8").trim();
+              fs.writeFileSync(confFile, JSON.stringify(config, null, 2));
+              console.log("[+] Injected valid updater pubkey into tauri.conf.json");
+            }
+
+            // 2. Strip Windows carriage returns (\r) so GitHub Actions matches EOF delimiter cleanly
+            const key = fs.readFileSync("./ci_key", "utf8").replace(/\r/g, "").trim();
+            if (process.env.GITHUB_ENV) {
+              fs.appendFileSync(process.env.GITHUB_ENV, `TAURI_SIGNING_PRIVATE_KEY<<EOF\n${key}\nEOF\n`);
+              console.log("[+] Successfully set TAURI_SIGNING_PRIVATE_KEY in GITHUB_ENV");
+            }
+          '
+
+      - name: Build Tauri Application
+        run: pnpm tauri build --target ${{ matrix.target }} ${{ matrix.bundle_args }}
+
+      - name: Upload Windows 11 Installer
+        if: matrix.platform == 'windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clash-Verge-Rev-Win11-x64
+          path: |
+            **/bundle/nsis/*.exe
+            **/bundle/msi/*.msi
+
+      - name: Upload Fedora RPM Installer
+        if: matrix.platform == 'linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: Clash-Verge-Rev-Fedora-RPM-x64
+          path: |
+            **/bundle/rpm/*.rpm
