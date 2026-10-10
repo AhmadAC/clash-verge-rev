@@ -1,4 +1,4 @@
-import React, { useCallback, useMemo, useRef } from 'react'
+import React, { useCallback, useEffect, useMemo, useRef } from 'react'
 import {
   getBaseConfig,
   getRuleProviders,
@@ -6,8 +6,15 @@ import {
 } from 'tauri-plugin-mihomo-api'
 
 import { useClashInfo, useRuntimeConfig } from '@/hooks/use-clash'
+import { useProfiles } from '@/hooks/use-profiles'
 import { useVerge } from '@/hooks/use-verge'
-import { getProxyView, getSystemProxy } from '@/services/cmds'
+import {
+  getProxyView,
+  getSystemProxy,
+  patchVergeConfig,
+  updateProfile,
+} from '@/services/cmds'
+import { subscribeVergeEvents } from '@/services/events'
 import { useQuery } from '@/services/query-client'
 import { useRunState } from '@/store/app-store-context'
 import { resolveDisplayedMixedPort } from '@/utils/mixed-port'
@@ -36,6 +43,21 @@ const TQ_DEFAULTS = {
   retry: 2,
 } as const
 
+const PROXY_SERVER_TYPES = new Set([
+  'Shadowsocks',
+  'ShadowsocksR',
+  'Vmess',
+  'Vless',
+  'Trojan',
+  'Hysteria',
+  'Hysteria2',
+  'WireGuard',
+  'Tuic',
+  'Ssh',
+  'Http',
+  'Socks5',
+])
+
 function useStableFn<T extends (...args: any[]) => any>(fn: T): T {
   const ref = useRef(fn)
   ref.current = fn
@@ -49,8 +71,12 @@ export const AppDataProvider = ({
   children: React.ReactNode
 }) => {
   const { verge } = useVerge()
+  const { current: currentProfile } = useProfiles()
   const { data: runtimeConfig } = useRuntimeConfig()
   const { clashInfo } = useClashInfo()
+
+  const isRecoveringRef = useRef(false)
+  const lastRecoveryTimeRef = useRef(0)
 
   const {
     data: proxyView,
@@ -104,6 +130,97 @@ export const AppDataProvider = ({
   const refreshRules = useStableFn(_refetchRules)
   const refreshSysproxy = useStableFn(_refetchSysproxy)
   const refreshRuleProviders = useStableFn(_refetchRuleProviders)
+
+  // ---------------- Auto Recovery Logic ----------------
+  useEffect(() => {
+    const handleDeadNodesRecovery = async () => {
+      const rawView = proxyView as any
+      const rawProxies =
+        rawView?.proxies || rawView?.records || rawView?.items || rawView?.nodes
+
+      // Only proceed if TUN mode is enabled, not currently recovering, and proxies exist
+      if (!verge?.enable_tun_mode || isRecoveringRef.current || !rawProxies) {
+        return
+      }
+
+      // Enforce a minimum 60-second cooldown between auto-recovery attempts
+      if (Date.now() - lastRecoveryTimeRef.current < 60000) {
+        return
+      }
+
+      // Filter for actual proxy server nodes (ignore selectors, groups, direct, reject)
+      const proxyList = Array.isArray(rawProxies)
+        ? rawProxies
+        : Object.values(rawProxies)
+      const proxyNodes = proxyList.filter(
+        (node: any) => node?.type && PROXY_SERVER_TYPES.has(node.type),
+      )
+
+      if (proxyNodes.length === 0) return
+
+      // Check if all proxy nodes have failed / timed out (delay === 0 or undefined)
+      const allDead = proxyNodes.every((node: any) => {
+        const lastDelay = node.history?.[node.history.length - 1]?.delay
+        return !lastDelay || lastDelay === 0
+      })
+
+      if (allDead) {
+        console.warn(
+          '[Auto-Recovery] All proxy nodes are dead. Temporarily disabling TUN mode to refresh subscription...',
+        )
+        isRecoveringRef.current = true
+
+        try {
+          // 1. Temporarily disable TUN mode
+          await patchVergeConfig({ enable_tun_mode: false })
+          await new Promise((resolve) => setTimeout(resolve, 2000))
+
+          // 2. Refresh active subscription profile
+          const targetUid =
+            typeof currentProfile === 'string'
+              ? currentProfile
+              : currentProfile?.uid
+          if (targetUid) {
+            console.log(`[Auto-Recovery] Updating subscription: ${targetUid}`)
+            await updateProfile(targetUid)
+            await new Promise((resolve) => setTimeout(resolve, 3000))
+          }
+
+          // 3. Re-enable TUN mode
+          await patchVergeConfig({ enable_tun_mode: true })
+          console.log(
+            '[Auto-Recovery] Subscription updated. TUN mode re-enabled.',
+          )
+        } catch (error) {
+          console.error('[Auto-Recovery Error]', error)
+        } finally {
+          lastRecoveryTimeRef.current = Date.now()
+          setTimeout(() => {
+            isRecoveringRef.current = false
+          }, 15000)
+        }
+      }
+    }
+
+    handleDeadNodesRecovery()
+  }, [proxyView, verge?.enable_tun_mode, currentProfile])
+  // -----------------------------------------------------
+
+  useEffect(() => {
+    let lastProxyUpdateTime = 0
+    const refreshThrottle = 800
+
+    const handleRefreshProxy = () => {
+      const now = Date.now()
+      if (now - lastProxyUpdateTime <= refreshThrottle) return
+      lastProxyUpdateTime = now
+      refreshProxy().catch(() => {})
+    }
+
+    return subscribeVergeEvents({
+      'verge://refresh-proxy-config': handleRefreshProxy,
+    })
+  }, [refreshProxy])
 
   const refreshAll = useCallback(async () => {
     await Promise.all([
