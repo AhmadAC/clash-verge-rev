@@ -8,7 +8,6 @@ import {
 
 import { useClashInfo, useRuntimeConfig } from '@/hooks/use-clash'
 import { useProfiles } from '@/hooks/use-profiles'
-import { runStateQueryKey } from '@/hooks/use-system-state'
 import { useVerge } from '@/hooks/use-verge'
 import {
   getProxyView,
@@ -121,9 +120,8 @@ export const AppDataProvider = ({
     ...TQ_DEFAULTS,
   })
 
-  // Same key as `useSystemState`, so this is the one Run State cache entry, not a second one.
   const { data: runState, isPending: isRunningModePending } = useQuery({
-    queryKey: runStateQueryKey,
+    queryKey: ['getRuntimeState'],
     queryFn: getRuntimeState,
     ...TQ_DEFAULTS,
   })
