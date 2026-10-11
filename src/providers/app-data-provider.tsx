@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef } from 'react'
+import { listen } from '@tauri-apps/api/event'
 import {
   getBaseConfig,
   getRuleProviders,
@@ -7,16 +8,16 @@ import {
 
 import { useClashInfo, useRuntimeConfig } from '@/hooks/use-clash'
 import { useProfiles } from '@/hooks/use-profiles'
+import { runStateQueryKey } from '@/hooks/use-system-state'
 import { useVerge } from '@/hooks/use-verge'
 import {
   getProxyView,
+  getRuntimeState,
   getSystemProxy,
   patchVergeConfig,
   updateProfile,
 } from '@/services/cmds'
-import { subscribeVergeEvents } from '@/services/events'
 import { useQuery } from '@/services/query-client'
-import { useRunState } from '@/store/app-store-context'
 import { resolveDisplayedMixedPort } from '@/utils/mixed-port'
 
 import {
@@ -120,9 +121,12 @@ export const AppDataProvider = ({
     ...TQ_DEFAULTS,
   })
 
-  // Store-owned run state; the event bus and the store's safety net write it.
-  const runState = useRunState()
-  const isRunningModePending = runState == null
+  // Same key as `useSystemState`, so this is the one Run State cache entry, not a second one.
+  const { data: runState, isPending: isRunningModePending } = useQuery({
+    queryKey: runStateQueryKey,
+    queryFn: getRuntimeState,
+    ...TQ_DEFAULTS,
+  })
   const runningMode = runState?.mode
 
   const refreshProxy = useStableFn(_refetchProxyView)
@@ -135,8 +139,7 @@ export const AppDataProvider = ({
   useEffect(() => {
     const handleDeadNodesRecovery = async () => {
       const rawView = proxyView as any
-      const rawProxies =
-        rawView?.proxies || rawView?.records || rawView?.items || rawView?.nodes
+      const rawProxies = rawView?.proxies || rawView?.records || rawView?.items || rawView?.nodes
 
       // Only proceed if TUN mode is enabled, not currently recovering, and proxies exist
       if (!verge?.enable_tun_mode || isRecoveringRef.current || !rawProxies) {
@@ -149,11 +152,9 @@ export const AppDataProvider = ({
       }
 
       // Filter for actual proxy server nodes (ignore selectors, groups, direct, reject)
-      const proxyList = Array.isArray(rawProxies)
-        ? rawProxies
-        : Object.values(rawProxies)
-      const proxyNodes = proxyList.filter(
-        (node: any) => node?.type && PROXY_SERVER_TYPES.has(node.type),
+      const proxyList = Array.isArray(rawProxies) ? rawProxies : Object.values(rawProxies)
+      const proxyNodes = proxyList.filter((node: any) =>
+        node?.type && PROXY_SERVER_TYPES.has(node.type)
       )
 
       if (proxyNodes.length === 0) return
@@ -166,7 +167,7 @@ export const AppDataProvider = ({
 
       if (allDead) {
         console.warn(
-          '[Auto-Recovery] All proxy nodes are dead. Temporarily disabling TUN mode to refresh subscription...',
+          '[Auto-Recovery] All proxy nodes are dead. Temporarily disabling TUN mode to refresh subscription...'
         )
         isRecoveringRef.current = true
 
@@ -176,10 +177,7 @@ export const AppDataProvider = ({
           await new Promise((resolve) => setTimeout(resolve, 2000))
 
           // 2. Refresh active subscription profile
-          const targetUid =
-            typeof currentProfile === 'string'
-              ? currentProfile
-              : currentProfile?.uid
+          const targetUid = typeof currentProfile === 'string' ? currentProfile : currentProfile?.uid
           if (targetUid) {
             console.log(`[Auto-Recovery] Updating subscription: ${targetUid}`)
             await updateProfile(targetUid)
@@ -188,9 +186,7 @@ export const AppDataProvider = ({
 
           // 3. Re-enable TUN mode
           await patchVergeConfig({ enable_tun_mode: true })
-          console.log(
-            '[Auto-Recovery] Subscription updated. TUN mode re-enabled.',
-          )
+          console.log('[Auto-Recovery] Subscription updated. TUN mode re-enabled.')
         } catch (error) {
           console.error('[Auto-Recovery Error]', error)
         } finally {
@@ -217,9 +213,14 @@ export const AppDataProvider = ({
       refreshProxy().catch(() => {})
     }
 
-    return subscribeVergeEvents({
-      'verge://refresh-proxy-config': handleRefreshProxy,
-    })
+    const unlistenPromise = listen(
+      'verge://refresh-proxy-config',
+      handleRefreshProxy,
+    )
+
+    return () => {
+      unlistenPromise.then((unlisten) => unlisten()).catch(console.error)
+    }
   }, [refreshProxy])
 
   const refreshAll = useCallback(async () => {
