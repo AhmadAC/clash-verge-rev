@@ -62,7 +62,7 @@ pub struct PrfItem {
     pub home: Option<String>,
 
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub latency_test_urls: Option<Vec<String>>,
+    pub latency_test_urls: Option<HashMap<String, String>>,
 
     #[serde(skip)]
     pub file_data: Option<String>,
