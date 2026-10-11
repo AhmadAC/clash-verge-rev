@@ -10,23 +10,12 @@ permissions:
   contents: write
 
 jobs:
-  build-app:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            platform: windows
-            target: x86_64-pc-windows-msvc
-            bundle_args: ""
-
-          - os: ubuntu-22.04
-            platform: linux
-            target: x86_64-unknown-linux-gnu
-            bundle_args: "--bundles rpm"
-
-    runs-on: ${{ matrix.os }}
-
+  # ==========================================
+  # 1. WINDOWS 11 BUILD
+  # ==========================================
+  build-windows:
+    name: Build Windows 11 Installer
+    runs-on: windows-latest
     env:
       NODE_OPTIONS: "--max-old-space-size=4096"
       CARGO_TERM_COLOR: always
@@ -52,46 +41,26 @@ jobs:
       - name: Set up Rust Toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-pc-windows-msvc
 
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
         with:
           workspaces: src-tauri
 
-      - name: Install Linux Build Dependencies
-        if: matrix.platform == 'linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential \
-            curl \
-            wget \
-            file \
-            libssl-dev \
-            libgtk-3-dev \
-            libwebkit2gtk-4.1-dev \
-            libayatana-appindicator3-dev \
-            librsvg2-dev \
-            patchelf \
-            rpm \
-            libxslt1.1
-
       - name: Install Node Modules
         run: pnpm install
 
       - name: Download Sidecars & Mihomo Cores
-        run: pnpm run prebuild ${{ matrix.target }}
+        run: pnpm run prebuild x86_64-pc-windows-msvc
 
       # Generates a valid signing keypair and safely writes to GITHUB_ENV without Windows CRLF conflicts
-      - name: Setup Valid Updater Keys for Fork
+      - name: Setup Valid Updater Keys
         shell: bash
         run: |
           pnpm tauri signer generate --ci -w ./ci_key
           node -e '
             const fs = require("fs");
-
-            // 1. Inject valid public key into tauri.conf.json for runtime
             const confFile = "src-tauri/tauri.conf.json";
             if (fs.existsSync(confFile)) {
               const config = JSON.parse(fs.readFileSync(confFile, "utf8"));
@@ -101,8 +70,6 @@ jobs:
               fs.writeFileSync(confFile, JSON.stringify(config, null, 2));
               console.log("[+] Injected valid updater pubkey into tauri.conf.json");
             }
-
-            // 2. Strip Windows carriage returns (\r) so GitHub Actions matches EOF delimiter cleanly
             const key = fs.readFileSync("./ci_key", "utf8").replace(/\r/g, "").trim();
             if (process.env.GITHUB_ENV) {
               fs.appendFileSync(process.env.GITHUB_ENV, `TAURI_SIGNING_PRIVATE_KEY<<EOF\n${key}\nEOF\n`);
@@ -111,10 +78,9 @@ jobs:
           '
 
       - name: Build Tauri Application
-        run: pnpm tauri build --target ${{ matrix.target }} ${{ matrix.bundle_args }}
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis,msi
 
       - name: Upload Windows 11 Installer
-        if: matrix.platform == 'windows'
         uses: actions/upload-artifact@v4
         with:
           name: Clash-Verge-Rev-Win11-x64
@@ -122,10 +88,74 @@ jobs:
             **/bundle/nsis/*.exe
             **/bundle/msi/*.msi
 
-      - name: Upload Fedora RPM Installer
-        if: matrix.platform == 'linux'
+  # ==========================================
+  # 2. FEDORA 44 RPM BUILD
+  # ==========================================
+  build-fedora44:
+    name: Build Fedora 44 RPM
+    runs-on: ubuntu-latest
+    env:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      CARGO_TERM_COLOR: always
+
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Build Fedora 44 RPM in Native Container
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/workspace" \
+            -w /workspace \
+            fedora:44 bash -c '
+              set -e
+
+              echo "[1/6] Installing Fedora build dependencies..."
+              dnf install -y \
+                gcc gcc-c++ make curl wget file git patchelf rpm-build \
+                openssl-devel gtk3-devel webkit2gtk4.1-devel \
+                libayatana-appindicator-devel librsvg2-devel libxslt-devel nodejs npm
+
+              echo "[2/6] Installing Rust toolchain..."
+              curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+              source "$HOME/.cargo/env"
+
+              echo "[3/6] Installing pnpm..."
+              npm install -g pnpm
+
+              echo "[4/6] Installing project dependencies..."
+              pnpm install
+
+              echo "[5/6] Prebuilding sidecars..."
+              pnpm run prebuild x86_64-unknown-linux-gnu
+
+              # Generate updater keypair for Linux
+              pnpm tauri signer generate --ci -w ./ci_key
+              export TAURI_SIGNING_PRIVATE_KEY="$(cat ./ci_key)"
+
+              node -e '\''
+                const fs = require("fs");
+                const confFile = "src-tauri/tauri.conf.json";
+                if (fs.existsSync(confFile)) {
+                  const config = JSON.parse(fs.readFileSync(confFile, "utf8"));
+                  if (!config.plugins) config.plugins = {};
+                  if (!config.plugins.updater) config.plugins.updater = {};
+                  config.plugins.updater.pubkey = fs.readFileSync("./ci_key.pub", "utf8").trim();
+                  fs.writeFileSync(confFile, JSON.stringify(config, null, 2));
+                  console.log("[+] Injected valid updater pubkey into tauri.conf.json");
+                }
+              '\''
+
+              echo "[6/6] Building Fedora RPM package..."
+              pnpm tauri build --target x86_64-unknown-linux-gnu --bundles rpm
+            '
+
+      - name: Upload Fedora 44 RPM Installer
         uses: actions/upload-artifact@v4
         with:
-          name: Clash-Verge-Rev-Fedora-RPM-x64
+          name: Clash-Verge-Rev-Fedora44-RPM-x64
           path: |
             **/bundle/rpm/*.rpm
