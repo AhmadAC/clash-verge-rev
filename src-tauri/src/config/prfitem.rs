@@ -61,6 +61,9 @@ pub struct PrfItem {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub home: Option<String>,
 
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub latency_test_urls: Option<Vec<String>>,
+
     #[serde(skip)]
     pub file_data: Option<String>,
 }
@@ -231,6 +234,7 @@ impl PrfItem {
                 ..PrfOption::default()
             }),
             home: None,
+            latency_test_urls: None,
             updated: Some(chrono::Local::now().timestamp() as usize),
             file_data: Some(file_data.unwrap_or_else(|| tmpl::ITEM_LOCAL.into())),
         })
@@ -412,6 +416,7 @@ impl PrfItem {
                 ..PrfOption::default()
             }),
             home,
+            latency_test_urls: None,
             updated: Some(chrono::Local::now().timestamp() as usize),
             file_data: Some(data.into()),
         })
