@@ -54,7 +54,6 @@ jobs:
       - name: Download Sidecars & Mihomo Cores
         run: pnpm run prebuild x86_64-pc-windows-msvc
 
-      # Generates a valid signing keypair and ensures WebView2 is not embedded
       - name: Setup Valid Updater Keys & Config
         shell: bash
         run: |
@@ -64,19 +63,17 @@ jobs:
             const confFile = "src-tauri/tauri.conf.json";
             if (fs.existsSync(confFile)) {
               const config = JSON.parse(fs.readFileSync(confFile, "utf8"));
-              
-              // 1. Inject updater pubkey
               if (!config.plugins) config.plugins = {};
               if (!config.plugins.updater) config.plugins.updater = {};
               config.plugins.updater.pubkey = fs.readFileSync("./ci_key.pub", "utf8").trim();
-              
-              // 2. Ensure WebView2 is not bundled offline (keeps installer < 60MB)
+
+              // Prevent embedding offline WebView2 (~150MB bloat)
               if (!config.bundle) config.bundle = {};
               if (!config.bundle.windows) config.bundle.windows = {};
               config.bundle.windows.webviewInstallMode = { type: "downloadBootstrapper" };
 
               fs.writeFileSync(confFile, JSON.stringify(config, null, 2));
-              console.log("[+] Injected updater key & enforced lightweight WebView2 mode");
+              console.log("[+] Configured updater key and lightweight WebView2 mode");
             }
             const key = fs.readFileSync("./ci_key", "utf8").replace(/\r/g, "").trim();
             if (process.env.GITHUB_ENV) {
@@ -85,7 +82,7 @@ jobs:
             }
           '
 
-      # Standard Clash Verge Rev installer is NSIS (.exe)
+      # Only build NSIS installer (.exe)
       - name: Build Tauri Application
         run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
 
@@ -93,8 +90,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Clash-Verge-Rev-Win11-x64-Setup
-          path: src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*-setup.exe
-          if-no-files-found: error
+          path: "**/bundle/nsis/*.exe"
 
   # ==========================================
   # 2. FEDORA 44 RPM BUILD
@@ -141,7 +137,6 @@ jobs:
               echo "[5/6] Prebuilding sidecars..."
               pnpm run prebuild x86_64-unknown-linux-gnu
 
-              # Generate updater keypair for Linux
               pnpm tauri signer generate --ci -w ./ci_key
               export TAURI_SIGNING_PRIVATE_KEY="$(cat ./ci_key)"
 
@@ -161,7 +156,6 @@ jobs:
               echo "[6/6] Building Fedora RPM package..."
               pnpm tauri build --target x86_64-unknown-linux-gnu --bundles rpm
 
-              # Ensure files created by root in container are readable by host runner
               chmod -R a+rw /workspace/src-tauri/target || true
             '
 
@@ -169,5 +163,4 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: Clash-Verge-Rev-Fedora44-RPM-x64
-          path: src-tauri/target/x86_64-unknown-linux-gnu/release/bundle/rpm/*.rpm
-          if-no-files-found: error
+          path: "**/bundle/rpm/*.rpm"
