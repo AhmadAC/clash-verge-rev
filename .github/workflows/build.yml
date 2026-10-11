@@ -115,9 +115,10 @@ jobs:
 
               echo "[1/6] Installing Fedora build dependencies..."
               dnf install -y \
-                gcc gcc-c++ make curl wget file git patchelf rpm-build \
+                gcc gcc-c++ make wget file git patchelf rpm-build \
                 openssl-devel gtk3-devel webkit2gtk4.1-devel \
-                libayatana-appindicator-devel librsvg2-devel libxslt-devel nodejs npm
+                libayatana-appindicator-gtk3-devel librsvg2-devel \
+                libxslt-devel nodejs npm
 
               echo "[2/6] Installing Rust toolchain..."
               curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
@@ -151,6 +152,9 @@ jobs:
 
               echo "[6/6] Building Fedora RPM package..."
               pnpm tauri build --target x86_64-unknown-linux-gnu --bundles rpm
+
+              # Ensure files created by root in container are readable by host runner
+              chmod -R a+rw /workspace/src-tauri/target || true
             '
 
       - name: Upload Fedora 44 RPM Installer
